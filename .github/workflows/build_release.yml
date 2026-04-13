@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Release tag (semver, e.g. v1.0.0). Used for artifact names and GitHub release."
+        required: true
+        type: string
 
 jobs:
   build:
@@ -36,8 +42,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          VERSION="${GITHUB_REF_NAME#v}"
-          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            REF_NAME="${{ github.event.inputs.version_tag }}"
+          else
+            REF_NAME="${GITHUB_REF_NAME}"
+          fi
+
+          VERSION="${REF_NAME#v}"
+          TAG="${REF_NAME}"
 
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "TAG=${TAG}" >> "$GITHUB_ENV"
@@ -164,10 +176,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          # stapler validate is the reliable check after notarization. spctl on .dmg often returns
+          # "rejected (Insufficient Context)" on GitHub-hosted runners and must not gate CI.
           "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/stapler" validate "${{ env.DMG_PATH }}"
-          # spctl often reports "rejected (Insufficient Context)" for DMG on GitHub-hosted macOS
-          # even when notarization is valid; stapler validate above is the reliable gate.
-          spctl -a -vv -t open "${{ env.DMG_PATH }}" || true
 
       - name: Generate checksum
         run: |
