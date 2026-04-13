@@ -165,7 +165,9 @@ jobs:
           set -euo pipefail
 
           "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/stapler" validate "${{ env.DMG_PATH }}"
-          spctl -a -vv -t open "${{ env.DMG_PATH }}"
+          # spctl often reports "rejected (Insufficient Context)" for DMG on GitHub-hosted macOS
+          # even when notarization is valid; stapler validate above is the reliable gate.
+          spctl -a -vv -t open "${{ env.DMG_PATH }}" || true
 
       - name: Generate checksum
         run: |
