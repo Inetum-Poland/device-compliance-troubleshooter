@@ -17,4 +17,7 @@ on:
 jobs:
   assign:
     name: "Assign"
+    permissions:
+      pull-requests: write
+      contents: read
     uses: Inetum-Poland/.github/.github/workflows/assign_label.yml@main

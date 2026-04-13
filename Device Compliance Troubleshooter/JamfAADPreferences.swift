@@ -79,4 +79,3 @@ final class JamfAADPreferences {
         CFPreferencesAppSynchronize(domain as CFString)
     }
 }
-

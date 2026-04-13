@@ -1,40 +1,80 @@
-name: "Package and Release"
+name: "Build release DMG"
 
 on:
-  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
 
 jobs:
   build:
-    name: "Build Release"
+    name: "Build release artifact"
     runs-on: macos-15
+
+    permissions:
+      contents: write
+
     env:
       XCODE_PATH: "/Applications/Xcode_16.app"
-      # These variables are defined in the repository settings
-      PROJECT_NAME: ${{ vars.PROJECT_NAME }}
-      INSTALLER_CERTIFICATE: ${{ vars.DEV_INSTALLER_CERT_CN }}
+      PROJECT_NAME: "Device Compliance Troubleshooter"
+      SCHEME: "Device Compliance Troubleshooter"
+      APP_NAME: "Device Compliance Troubleshooter"
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4 # v4
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install app signing certificate
-        uses: apple-actions/import-codesign-certs@v3 # v3
+        uses: apple-actions/import-codesign-certs@v3
         with:
           keychain-password: ${{ github.run_id }}
           p12-file-base64: ${{ secrets.APP_CERTIFICATE_P12 }}
           p12-password: ${{ secrets.APP_CERTIFICATE_P12_PASSWORD }}
 
-      - name: Install package signing certificate
-        uses: apple-actions/import-codesign-certs@v3 # v3
-        with:
-          create-keychain: false # do not create a new keychain for this value
-          keychain-password: ${{ github.run_id }}
-          p12-file-base64: ${{ secrets.PKG_CERTIFICATE_P12 }}
-          p12-password: ${{ secrets.PKG_CERTIFICATE_P12_PASSWORD }}
-
-      - name: Build and analyze bundle
+      - name: Determine release version
         run: |
-          xcodebuild -project "${{ env.PROJECT_NAME }}/${{ env.PROJECT_NAME }}.xcodeproj" clean build analyze -configuration Release
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME}"
+
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=${{ env.PROJECT_NAME }}-${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build app
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            -project "Device Compliance Troubleshooter.xcodeproj" \
+            -scheme "Device Compliance Troubleshooter" \
+            clean build analyze \
+            -configuration Release \
+            -derivedDataPath DerivedData \
+            OTHER_CODE_SIGN_FLAGS="--timestamp"
+
+      - name: Locate app
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$(find "${GITHUB_WORKSPACE}/DerivedData/Build/Products/Release" -maxdepth 1 -name "*.app" | head -n 1)"
+
+          if [ -z "${APP_PATH}" ]; then
+            echo "No .app found in Release output"
+            exit 1
+          fi
+
+          echo "APP_PATH=${APP_PATH}" >> "$GITHUB_ENV"
+          echo "Found app: ${APP_PATH}"
+
+      - name: Verify app signature
+        run: |
+          set -euo pipefail
+
+          codesign --verify --deep --strict --verbose=2 "${{ env.APP_PATH }}"
+          codesign -dv --verbose=4 "${{ env.APP_PATH }}" || true
 
       - name: Setup notarization
         run: |
@@ -44,132 +84,126 @@ jobs:
             --issuer "${{ secrets.NOTARY_ISSUER_UUID }}" \
             default <<< "${{ secrets.NOTARY_AUTH_KEY }}"
 
-      - name: Notarize bundle
+      - name: Resolve Developer ID identity for DMG signing
+        env:
+          DEV_APPLICATION_CERT_CN: ${{ secrets.DEV_APPLICATION_CERT_CN }}
         run: |
-          BUNDLE="${{ env.PROJECT_NAME }}/build/Release/${{ env.PROJECT_NAME }}"
-          xattr -rc "${BUNDLE}.bundle"
-          ditto -c -k --keepParent "${BUNDLE}.bundle" "${BUNDLE}.zip"
-          "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/notarytool" submit \
-            "${BUNDLE}.zip" \
-            --keychain-profile "default" \
-            --wait
-          "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/stapler" staple \
-            "${BUNDLE}.bundle"
-          rm "${BUNDLE}.zip"
+          set -euo pipefail
+          if [ -n "${DEV_APPLICATION_CERT_CN}" ]; then
+            echo "Using repository secret DEV_APPLICATION_CERT_CN."
+            echo "CODESIGN_IDENTITY=${DEV_APPLICATION_CERT_CN}" >> "$GITHUB_ENV"
+          else
+            IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+            if [ -z "${IDENTITY}" ]; then
+              echo "No Developer ID Application identity found. Set secret DEV_APPLICATION_CERT_CN or import a valid P12."
+              security find-identity -v -p codesigning || true
+              exit 1
+            fi
+            echo "Resolved identity from keychain: ${IDENTITY}"
+            echo "CODESIGN_IDENTITY=${IDENTITY}" >> "$GITHUB_ENV"
+          fi
 
-      - name: Set environment variables
+      - name: Create DMG
         run: |
-          INFO_FILE="${{ env.PROJECT_NAME }}/build/Release/${{ env.PROJECT_NAME }}.bundle/Contents/Info.plist"
-          IDENTIFIER=$(/usr/libexec/PlistBuddy -c "Print:CFBundleIdentifier" "${INFO_FILE}")
-          echo "IDENTIFIER=${IDENTIFIER}" >> "$GITHUB_ENV"
-          VERSION=$(/usr/libexec/PlistBuddy -c "Print:CFBundleShortVersionString" "${INFO_FILE}")
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
-          echo "PKG_NAME=${{ env.PROJECT_NAME }}-${VERSION}" >> "$GITHUB_ENV"
-          PKG_DOT_NAME="${{ env.PROJECT_NAME }}-${VERSION}"
-          echo "PKG_DOT_NAME=${PKG_DOT_NAME// /.}" >> "$GITHUB_ENV"
-          echo "PKG_PATH=${{ env.PROJECT_NAME }}/build" >> "$GITHUB_ENV"
+          set -euo pipefail
 
-      - name: Build installer package
+          mkdir -p dmg-root
+          cp -R "${{ env.APP_PATH }}" "dmg-root/${{ env.APP_NAME }}.app"
+
+          DMG_PATH="${GITHUB_WORKSPACE}/${{ env.ARTIFACT_NAME }}.dmg"
+
+          hdiutil create \
+            -volname "${{ env.APP_NAME }}" \
+            -srcfolder "dmg-root" \
+            -ov \
+            -format UDZO \
+            "${DMG_PATH}"
+
+          codesign --force --sign "${{ env.CODESIGN_IDENTITY }}" --timestamp "${DMG_PATH}"
+
+          echo "DMG_PATH=${DMG_PATH}" >> "$GITHUB_ENV"
+          echo "Created DMG: ${DMG_PATH}"
+
+      - name: Notarize DMG
         run: |
-          ID="${{ env.IDENTIFIER }}"
-          PKGROOT=$(mktemp -d /tmp/${ID##*.}-build-root-XXXXXXXXXXX)
-          mkdir -p "${PKGROOT}/Library/Security/SecurityAgentPlugins"
-          cp -R "${{ env.PKG_PATH }}/Release/${{ env.PROJECT_NAME }}.bundle" "${PKGROOT}/Library/Security/SecurityAgentPlugins/${{ env.PROJECT_NAME }}.bundle"
-          pkgbuild --root "${PKGROOT}" \
-            --identifier "${ID}" \
-            --version "${{ env.VERSION }}" \
-            --scripts scripts/pkg \
-            "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}.pkg"
-          rm -rf "${PKGROOT}"
+          set -euo pipefail
 
-      - name: Convert to distribution package and sign
+          xattr -rc "${{ env.DMG_PATH }}"
+
+          SUBMISSION_OUTPUT=$(
+            "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/notarytool" submit \
+              "${{ env.DMG_PATH }}" \
+              --keychain-profile "default" \
+              --wait
+          )
+
+          echo "${SUBMISSION_OUTPUT}"
+
+          SUBMISSION_ID="$(echo "${SUBMISSION_OUTPUT}" | sed -n 's/^  id: //p' | head -n 1)"
+          STATUS="$(echo "${SUBMISSION_OUTPUT}" | sed -n 's/^  status: //p' | tail -n 1)"
+
+          echo "SUBMISSION_ID=${SUBMISSION_ID}" >> "$GITHUB_ENV"
+          echo "STATUS=${STATUS}" >> "$GITHUB_ENV"
+
+          if [ -z "${SUBMISSION_ID}" ]; then
+            echo "Could not determine notarization submission ID"
+            exit 1
+          fi
+
+          if [ "${STATUS}" != "Accepted" ]; then
+            echo "Notarization failed with status: ${STATUS}"
+            "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/notarytool" log \
+              "${SUBMISSION_ID}" \
+              --keychain-profile "default"
+            exit 1
+          fi
+
+          "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/stapler" staple "${{ env.DMG_PATH }}"
+
+      - name: Validate DMG
         run: |
-          productbuild --sign "${{ env.INSTALLER_CERTIFICATE }}" \
-            --package "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}.pkg" \
-            "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}-signed.pkg"
-          rm -f "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}.pkg"
+          set -euo pipefail
 
-      - name: Notarize package
+          "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/stapler" validate "${{ env.DMG_PATH }}"
+          spctl -a -vv -t open "${{ env.DMG_PATH }}"
+
+      - name: Generate checksum
         run: |
-          "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/notarytool" submit \
-            "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}-signed.pkg" \
-            --keychain-profile "default" \
-            --wait
-          "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/stapler" staple \
-            "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}-signed.pkg"
-          mkdir -p artifacts
-          mv "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}-signed.pkg" "artifacts/${{ env.PKG_DOT_NAME }}.pkg"
+          set -euo pipefail
 
-      - name: Generate checksum and define release date
+          shasum -a 256 "${{ env.DMG_PATH }}" > "${{ env.DMG_PATH }}.sha256"
+
+      - name: Generate release notes
         run: |
-          CHECKSUM=$(sha256 -q "artifacts/${{ env.PKG_DOT_NAME }}.pkg")
-          echo "${CHECKSUM} ${{ env.PKG_DOT_NAME }}.pkg" > "artifacts/${{ env.PKG_DOT_NAME }}.pkg.sha256"
-          echo "CHECKSUM=${CHECKSUM}" >> "$GITHUB_ENV"
-          RELEASE_DATE="$(stat -f %Sm -t "%Y-%m-%d %H:%M:%S" "artifacts/${{ env.PKG_DOT_NAME }}.pkg")"
-          echo "RELEASE_DATE=${RELEASE_DATE}" >> "$GITHUB_ENV"
+          set -euo pipefail
 
-      - name: Get latest release
-        id: latest
-        uses: pozetroninc/github-action-get-latest-release@v0.8.0 # v0.8.0
-        with:
-          repository: ${{ github.repository }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          excludes: prerelease, draft
+          PREVIOUS_TAG="$(git tag --sort=-version:refname | grep '^v' | grep -vx "${TAG}" | head -n 1 || true)"
 
-      - name: Get Changelog file entries
-        id: changelog_reader
-        uses: mindsers/changelog-reader-action@v2 # v2.2.2
-        with:
-          validation_depth: 50
-          version: ${{ env.VERSION }}
+          {
+            echo "## Release ${TAG}"
+            echo
+            if [ -n "${PREVIOUS_TAG}" ]; then
+              echo "### Changes since ${PREVIOUS_TAG}"
+              echo
+              git log --pretty=format:'- %s (%h)' "${PREVIOUS_TAG}..HEAD"
+            else
+              echo "Initial release."
+            fi
+            echo
+            echo "### Artifacts"
+            echo
+            echo "- \`${{ env.ARTIFACT_NAME }}.dmg\`"
+            echo "- \`${{ env.ARTIFACT_NAME }}.dmg.sha256\`"
+          } > RELEASE_NOTES.md
 
-      - name: Generate changelog
-        id: changelog
-        uses: metcalfc/changelog-generator@v4.3.1 # v4.3.1
-        with:
-          myToken: ${{ secrets.GITHUB_TOKEN }}
-          base-ref: ${{ steps.latest.outputs.release }}
-          head-ref: v${{ env.VERSION }}
-          reverse: 'true'
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
 
-      - name: Create Release
-        id: create_release
-        uses:   softprops/action-gh-release@v2 # v2
-        with:
-          name: ${{ vars.PROJECT_NAME }} ${{ env.VERSION }}
-          tag_name: v${{ env.VERSION }}
-          draft: false
-          prerelease: false
-          token: ${{ secrets.GITHUB_TOKEN }}
-          body: |
-              <sup>Release date: ${{ env.RELEASE_DATE }} UTC</sup>
-
-              ## Notes
-              This is a version of **${{ vars.PROJECT_NAME }}** created by GitHub Actions.
-              Both `${{ vars.PROJECT_NAME }}.bundle` and installation package have been signed, notarized and stapled.
-
-              For more information, read [Wiki](${{ github.server_url }}/${{ github.repository }}/wiki).
-
-              ## Changelog
-              ${{ steps.changelog_reader.outputs.changes }}
-
-              ## Changes since [${{ steps.latest.outputs.release }}](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.latest.outputs.release }})
-              ${{ steps.changelog.outputs.changelog }}
-
-              #### Full Changelog: [${{ steps.latest.outputs.release }}...v${{ env.VERSION}}](${{ github.server_url }}/${{ github.repository }}/compare/${{ steps.latest.outputs.release }}...v${{ env.VERSION}})
-              <sup>Contributed by @bsojka</sup>
-              ___
-              #### SHA256 checksum of `${{ env.PKG_DOT_NAME }}.pkg`:
-              ```
-              ${{ env.CHECKSUM }}
-              ```
-          files: |
-            ${{ github.workspace }}/artifacts/*.pkg
-            ${{ github.workspace }}/artifacts/*.pkg.sha256
-
-      - name: Upload package
-        uses: actions/upload-artifact@v4 # v4
-        with:
-          name: ${{ env.PKG_NAME }}
-          path: artifacts/
-          retention-days: 14
+          gh release create "${TAG}" \
+            "${{ env.DMG_PATH }}" \
+            "${{ env.DMG_PATH }}.sha256" \
+            --title "${TAG}" \
+            --notes-file RELEASE_NOTES.md

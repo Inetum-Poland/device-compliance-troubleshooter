@@ -36,12 +36,12 @@ enum EndpointValidationError: Error {
 @MainActor
 final class EndpointTester: ObservableObject {
     @Published var endpoints: [Endpoint] = [
-        
-        
+
+
             Endpoint(name: "Apple Content Delivery Network (CDN)", host: "app-site-association.cdn-apple.com", port: 443),
             Endpoint(name: "Apple Networking (Global)", host: "app-site-association.networking.apple", port: 443),
             // MARK: - Entra ID sign-in (Global + US Gov)
-    
+
             Endpoint(name: "Entra ID Login (Global)", host: "login.microsoftonline.com", port: 443),
             Endpoint(name: "Entra ID Login (Alt)", host: "login.microsoft.com", port: 443),
 
@@ -263,7 +263,7 @@ struct ConnectionTesterView: View {
                         .padding(.vertical, 4)
                     }
                 }
-                .frame(minHeight: 240)
+                .frame(minHeight: 180)
             }
 
             GroupBox(label: Text("Add Endpoint")) {
@@ -304,7 +304,7 @@ struct ConnectionTesterView: View {
             }
         }
         .padding(20)
-        .frame(minWidth: 700, maxWidth: 700, minHeight: 700)
+        .frame(minWidth: 520, minHeight: 560)
     }
 }
 
