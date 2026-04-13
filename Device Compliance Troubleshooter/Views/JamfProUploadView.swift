@@ -7,6 +7,7 @@
 
 import SwiftUI
 import Combine
+import AppKit
 
 extension Notification.Name {
     static let refreshJamfUploaderPreview = Notification.Name("refreshJamfUploaderPreview")
@@ -109,6 +110,37 @@ final class JamfProUploadViewModel: ObservableObject {
         }
     }
 
+    func exportMobileConfig() {
+        refreshSettingsPreview()
+
+        do {
+            let cleanedName = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let fileName = cleanedName.isEmpty ? "JamfAAD.mobileconfig" : "\(sanitizedFileName(from: cleanedName)).mobileconfig"
+            let data = try JamfProUploader.mobileConfigData(profileName: cleanedName.isEmpty ? "JamfAAD" : cleanedName)
+
+            let savePanel = NSSavePanel()
+            savePanel.canCreateDirectories = true
+            savePanel.isExtensionHidden = false
+            savePanel.nameFieldStringValue = fileName
+            savePanel.allowedFileTypes = ["mobileconfig"]
+
+            if savePanel.runModal() == .OK, let url = savePanel.url {
+                try data.write(to: url, options: .atomic)
+                statusMessage = "Saved .mobileconfig to \(url.path)"
+            }
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func copySettingsPlist() {
+        guard hasSettingsToUpload else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(settingsPlistPreview, forType: .string)
+        statusMessage = "XML copied to clipboard."
+    }
+
     private func persistSession() {
         guard !isRestoringSession else { return }
         let session = JamfProUploadSessionStore.shared
@@ -119,6 +151,14 @@ final class JamfProUploadViewModel: ObservableObject {
         session.clientID = clientID
         session.clientSecret = clientSecret
         session.profileName = profileName
+    }
+
+    private func sanitizedFileName(from name: String) -> String {
+        let invalidCharacters = CharacterSet(charactersIn: "/:\\?%*|\"<>")
+        let cleaned = name.unicodeScalars.map { invalidCharacters.contains($0) ? "_" : String($0) }
+            .joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "JamfAAD" : cleaned
     }
 }
 
@@ -154,14 +194,14 @@ struct JamfProUploadView: View {
                     }
                     TextField("Profile Name", text: $viewModel.profileName)
                         .textFieldStyle(.roundedBorder)
-                    
+
                 }
                 .padding(.vertical, 4)
             }
 
-            GroupBox(label: Text("Profile Settings:")) {
+            GroupBox {
                 VStack(alignment: .leading, spacing: 8) {
-                      
+
                     if viewModel.hasSettingsToUpload {
                         ScrollView {
                             Text(viewModel.settingsPlistPreview)
@@ -170,7 +210,7 @@ struct JamfProUploadView: View {
                                 .textSelection(.enabled)
                                 .padding(10)
                         }
-                        .frame(minHeight: 269)
+                        .frame(minHeight: 180)
                         .background(Color.secondary.opacity(0.12))
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                     } else {
@@ -180,27 +220,44 @@ struct JamfProUploadView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.vertical, 4)
+            } label: {
+                HStack(spacing: 8) {
+                    Text("Profile Settings:")
+                    Spacer()
+                    Button {
+                        viewModel.copySettingsPlist()
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Copy XML")
+                    .disabled(!viewModel.hasSettingsToUpload)
+                }
             }
-            
+
             //Spacer()
-            
+
             HStack {
                 Text(viewModel.statusMessage)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Spacer()
+                Button("Download .mobileconfig") {
+                    viewModel.exportMobileConfig()
+                }
+                .disabled(!viewModel.hasSettingsToUpload)
                 Button(viewModel.isUploading ? "Uploading..." : "Upload to Jamf Pro") {
                     viewModel.upload()
                 }
                 .disabled(viewModel.isUploading || !viewModel.canUpload)
-               
+
             }
             Spacer()
 
         }
         .padding(20)
-        .frame(minWidth: 600, maxWidth: 700, minHeight: 620, maxHeight: 800)
-        
+        .frame(minWidth: 480, minHeight: 520)
+
         .onAppear {
             viewModel.refreshSettingsPreview()
         }

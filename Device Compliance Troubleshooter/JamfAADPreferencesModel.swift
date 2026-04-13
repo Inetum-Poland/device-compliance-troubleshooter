@@ -12,7 +12,7 @@ import Combine
 final class JamfAADPreferencesModel: ObservableObject {
     @Published var useWKWebView: Bool = false
     @Published var tokenRetryCount: Int = 0
-    @Published var tokenRetryWaitTime: Int = 5
+    @Published var tokenRetryWaitTime: Int = 0
     @Published var disableUPNLoginHint: Bool = false
     @Published var logPIIEnabled: Bool = false
 
@@ -21,7 +21,7 @@ final class JamfAADPreferencesModel: ObservableObject {
     func load() {
         useWKWebView = prefs.boolValue(forKey: "useWKWebView") ?? false
         tokenRetryCount = prefs.intValue(forKey: "tokenRetryCount") ?? 0
-        tokenRetryWaitTime = prefs.intValue(forKey: "tokenRetryWaitTime") ?? 5
+        tokenRetryWaitTime = prefs.intValue(forKey: "tokenRetryWaitTime") ?? 0
         disableUPNLoginHint = prefs.boolValue(forKey: "disableUPNLoginHint") ?? false
         logPIIEnabled = prefs.isLoggingEnabled
     }

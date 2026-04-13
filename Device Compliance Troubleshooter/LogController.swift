@@ -39,7 +39,7 @@ final class LogController: ObservableObject {
         runLogCommand(arguments: [
             "stream",
             "--predicate",
-            "subsystem CONTAINS \"InAdmin\"",
+            "subsystem CONTAINS \"jamfAAD\"",
             "--style",
             "syslog"
         ])
