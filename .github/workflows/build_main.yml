@@ -1,4 +1,4 @@
-name: "Package merges to main"
+name: "Build main DMG"
 
 on:
   workflow_dispatch:
@@ -7,34 +7,55 @@ jobs:
   build:
     name: "Build artifact"
     runs-on: macos-15
+
     env:
       XCODE_PATH: "/Applications/Xcode_16.app"
-      # These variables are defined in the repository settings:
-      PROJECT_NAME: ${{ vars.PROJECT_NAME }}
-      INSTALLER_CERTIFICATE: ${{ vars.DEV_INSTALLER_CERT_CN }}
+      PROJECT_NAME: "Device Compliance Troubleshooter"
+      SCHEME: "Device Compliance Troubleshooter"
+      APP_NAME: "Device Compliance Troubleshooter"
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4 # v4
+        uses: actions/checkout@v4
 
       - name: Install app signing certificate
-        uses: apple-actions/import-codesign-certs@v3 # v3
+        uses: apple-actions/import-codesign-certs@v3
         with:
           keychain-password: ${{ github.run_id }}
           p12-file-base64: ${{ secrets.APP_CERTIFICATE_P12 }}
           p12-password: ${{ secrets.APP_CERTIFICATE_P12_PASSWORD }}
 
-      - name: Install package signing certificate
-        uses: apple-actions/import-codesign-certs@v3 # v3
-        with:
-          create-keychain: false # do not create a new keychain for this value
-          keychain-password: ${{ github.run_id }}
-          p12-file-base64: ${{ secrets.PKG_CERTIFICATE_P12 }}
-          p12-password: ${{ secrets.PKG_CERTIFICATE_P12_PASSWORD }}
-
-      - name: Build and analyze bundle
+      - name: Build app
         run: |
-          xcodebuild -project "${{ env.PROJECT_NAME }}/${{ env.PROJECT_NAME }}.xcodeproj" clean build analyze -configuration Release
+          set -euo pipefail
+
+          xcodebuild \
+            -project "Device Compliance Troubleshooter.xcodeproj" \
+            -scheme "Device Compliance Troubleshooter" \
+            clean build analyze \
+            -configuration Release \
+            -derivedDataPath DerivedData
+
+      - name: Locate app
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$(find "${GITHUB_WORKSPACE}/DerivedData/Build/Products/Release" -maxdepth 1 -name "*.app" | head -n 1)"
+
+          if [ -z "${APP_PATH}" ]; then
+            echo "No .app found in Release output"
+            exit 1
+          fi
+
+          echo "APP_PATH=${APP_PATH}" >> "$GITHUB_ENV"
+          echo "Found app: ${APP_PATH}"
+
+      - name: Verify app signature
+        run: |
+          set -euo pipefail
+
+          codesign --verify --deep --strict --verbose=2 "${{ env.APP_PATH }}"
+          codesign -dv --verbose=4 "${{ env.APP_PATH }}" || true
 
       - name: Setup notarization
         run: |
@@ -44,63 +65,110 @@ jobs:
             --issuer "${{ secrets.NOTARY_ISSUER_UUID }}" \
             default <<< "${{ secrets.NOTARY_AUTH_KEY }}"
 
-      - name: Notarize bundle
+      - name: Resolve Developer ID identity for DMG signing
+        env:
+          DEV_APPLICATION_CERT_CN: ${{ secrets.DEV_APPLICATION_CERT_CN }}
         run: |
-          BUNDLE="${{ env.PROJECT_NAME }}/build/Release/${{ env.PROJECT_NAME }}"
-          xattr -rc "${BUNDLE}.bundle"
-          ditto -c -k --keepParent "${BUNDLE}.bundle" "${BUNDLE}.zip"
-          "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/notarytool" submit \
-            "${BUNDLE}.zip" \
-            --keychain-profile "default" \
-            --wait
-          "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/stapler" staple \
-            "${BUNDLE}.bundle"
-          rm "${BUNDLE}.zip"
+          set -euo pipefail
+          if [ -n "${DEV_APPLICATION_CERT_CN}" ]; then
+            echo "Using repository secret DEV_APPLICATION_CERT_CN."
+            echo "CODESIGN_IDENTITY=${DEV_APPLICATION_CERT_CN}" >> "$GITHUB_ENV"
+          else
+            IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+            if [ -z "${IDENTITY}" ]; then
+              echo "No Developer ID Application identity found. Set secret DEV_APPLICATION_CERT_CN or import a valid P12."
+              security find-identity -v -p codesigning || true
+              exit 1
+            fi
+            echo "Resolved identity from keychain: ${IDENTITY}"
+            echo "CODESIGN_IDENTITY=${IDENTITY}" >> "$GITHUB_ENV"
+          fi
 
-      - name: Set environment variables
+      - name: Create DMG
         run: |
-          INFO_FILE="${{ env.PROJECT_NAME }}/build/Release/${{ env.PROJECT_NAME }}.bundle/Contents/Info.plist"
-          IDENTIFIER=$(/usr/libexec/PlistBuddy -c "Print:CFBundleIdentifier" "${INFO_FILE}")
-          echo "IDENTIFIER=${IDENTIFIER}" >> "$GITHUB_ENV"
-          VERSION=$(/usr/libexec/PlistBuddy -c "Print:CFBundleShortVersionString" "${INFO_FILE}")
+          set -euo pipefail
+
+          mkdir -p dmg-root
+          cp -R "${{ env.APP_PATH }}" "dmg-root/${{ env.APP_NAME }}.app"
+
+          DMG_PATH="${GITHUB_WORKSPACE}/${{ env.APP_NAME }}.dmg"
+
+          hdiutil create \
+            -volname "${{ env.APP_NAME }}" \
+            -srcfolder "dmg-root" \
+            -ov \
+            -format UDZO \
+            "${DMG_PATH}"
+
+          codesign --force --sign "${{ env.CODESIGN_IDENTITY }}" --timestamp "${DMG_PATH}"
+
+          echo "DMG_PATH=${DMG_PATH}" >> "$GITHUB_ENV"
+          echo "Created DMG: ${DMG_PATH}"
+
+      - name: Notarize DMG
+        run: |
+          set -euo pipefail
+
+          xattr -rc "${{ env.DMG_PATH }}"
+
+          SUBMISSION_OUTPUT=$(
+            "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/notarytool" submit \
+              "${{ env.DMG_PATH }}" \
+              --keychain-profile "default" \
+              --wait
+          )
+
+          echo "${SUBMISSION_OUTPUT}"
+
+          SUBMISSION_ID="$(echo "${SUBMISSION_OUTPUT}" | sed -n 's/^  id: //p' | head -n 1)"
+          STATUS="$(echo "${SUBMISSION_OUTPUT}" | sed -n 's/^  status: //p' | tail -n 1)"
+
+          echo "SUBMISSION_ID=${SUBMISSION_ID}" >> "$GITHUB_ENV"
+          echo "STATUS=${STATUS}" >> "$GITHUB_ENV"
+
+          if [ -z "${SUBMISSION_ID}" ]; then
+            echo "Could not determine notarization submission ID"
+            exit 1
+          fi
+
+          if [ "${STATUS}" != "Accepted" ]; then
+            echo "Notarization failed with status: ${STATUS}"
+            "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/notarytool" log \
+              "${SUBMISSION_ID}" \
+              --keychain-profile "default"
+            exit 1
+          fi
+
+          "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/stapler" staple \
+            "${{ env.DMG_PATH }}"
+
+      - name: Validate DMG
+        run: |
+          set -euo pipefail
+
+          "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/stapler" validate "${{ env.DMG_PATH }}"
+          spctl -a -vv -t open "${{ env.DMG_PATH }}" || true
+
+      - name: Set artifact name
+        run: |
+          set -euo pipefail
+
+          APP_INFO="${{ env.APP_PATH }}/Contents/Info.plist"
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print:CFBundleShortVersionString" "${APP_INFO}")
+
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
-          echo "PKG_NAME=${{ env.PROJECT_NAME }}-${VERSION}" >> "$GITHUB_ENV"
-          echo "PKG_PATH=${{ env.PROJECT_NAME }}/build" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=${{ env.PROJECT_NAME }}-${VERSION}" >> "$GITHUB_ENV"
 
-      - name: Build installer package
+      - name: Prepare artifact
         run: |
-          ID="${{ env.IDENTIFIER }}"
-          PKGROOT=$(mktemp -d /tmp/${ID##*.}-build-root-XXXXXXXXXXX)
-          mkdir -p "${PKGROOT}/Library/Security/SecurityAgentPlugins"
-          cp -R "${{ env.PKG_PATH }}/Release/${{ env.PROJECT_NAME }}.bundle" "${PKGROOT}/Library/Security/SecurityAgentPlugins/${{ env.PROJECT_NAME }}.bundle"
-          pkgbuild --root "${PKGROOT}" \
-            --identifier "${ID}" \
-            --version "${{ env.VERSION }}" \
-            --scripts scripts/pkg \
-            "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}.pkg"
-          rm -rf "${PKGROOT}"
+          set -euo pipefail
 
-      - name: Convert to distribution package and sign
-        run: |
-          productbuild --sign "${{ env.INSTALLER_CERTIFICATE }}" \
-            --package "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}.pkg" \
-            "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}-signed.pkg"
-          rm -f "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}.pkg"
-
-      - name: Notarize package
-        run: |
-          "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/notarytool" submit \
-            "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}-signed.pkg" \
-            --keychain-profile "default" \
-            --wait
-          "${{ env.XCODE_PATH }}/Contents/Developer/usr/bin/stapler" staple \
-            "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}-signed.pkg"
           mkdir -p artifacts
-          mv "${{ env.PKG_PATH }}/${{ env.PKG_NAME }}-signed.pkg" "artifacts/${{ env.PKG_NAME }}.pkg"
+          cp "${{ env.DMG_PATH }}" "artifacts/${{ env.ARTIFACT_NAME }}.dmg"
 
-      - name: Upload package
-        uses: actions/upload-artifact@v4 # v4
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.PKG_NAME }}
+          name: ${{ env.ARTIFACT_NAME }}
           path: artifacts/
           retention-days: 14
