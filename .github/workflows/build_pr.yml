@@ -24,7 +24,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Install app signing certificate
-        uses: apple-actions/import-codesign-certs@v3
+        uses: apple-actions/import-codesign-certs@v6
         with:
           keychain-password: ${{ github.run_id }}
           p12-file-base64: ${{ secrets.APP_CERTIFICATE_P12 }}
